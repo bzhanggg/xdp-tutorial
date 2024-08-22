@@ -5,7 +5,9 @@
 #include <linux/if_ether.h>
 #include <linux/if_packet.h>
 #include <linux/ipv6.h>
+#include <linux/ip.h>
 #include <linux/icmpv6.h>
+#include <linux/icmp.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 /* Defines xdp_stats_map from packet04 */
@@ -111,6 +113,31 @@ static __always_inline int parse_ip6hdr(struct hdr_cursor *nh,
 	return ip6h->nexthdr;
 }
 
+/* ipv4 support */
+static __always_inline int parse_iphdr(struct hdr_cursor *nh, void *data_end, struct iphdr **iphdr)
+{
+	struct iphdr *iph = nh->pos;
+	int hdrsize;
+
+	// normal iphdr payload bounds check
+	if (iph + 1 > data_end)
+		return -1;
+	
+	// additional verify fullsize header fits in packet
+	hdrsize = iph->ihl * 4;
+	// ensure packet field is valid
+	if (hdrsize < sizeof(*iph))
+		return -1;
+	if (nh->pos + hdrsize > data_end)
+		return -1;
+	
+	// increment as usual
+	nh->pos += hdrsize;
+	*iphdr = iph;
+
+	return iph->protocol;
+}
+
 /* Assignment 3: Implement and use this */
 static __always_inline int parse_icmp6hdr(struct hdr_cursor *nh,
 					  void *data_end,
@@ -127,6 +154,19 @@ static __always_inline int parse_icmp6hdr(struct hdr_cursor *nh,
 	return icmp6h->icmp6_type;
 }
 
+/* ipv4 support */
+static __always_inline int parse_icmphdr(struct hdr_cursor *nh, void *data_end, struct icmphdr **icmphdr)
+{
+	struct icmphdr *icmph = nh->pos;
+
+	if (icmph + 1 > data_end)
+		return -1;
+
+	nh->pos = icmph + 1;
+	*icmphdr = icmph;
+	return icmph->type;
+}
+
 SEC("xdp")
 int  xdp_parser_func(struct xdp_md *ctx)
 {
@@ -134,7 +174,9 @@ int  xdp_parser_func(struct xdp_md *ctx)
 	void *data = (void *)(long)ctx->data;
 	struct ethhdr *eth;
 	struct ipv6hdr *ip6hdr;
+	struct iphdr *iphdr;
 	struct icmp6hdr *icmp6hdr;
+	struct icmphdr *icmphdr;
 
 	/* Default action XDP_PASS, imply everything we couldn't parse, or that
 	 * we don't want to deal with, we just pass up the stack and let the
@@ -163,31 +205,39 @@ int  xdp_parser_func(struct xdp_md *ctx)
 		goto out;
 	}
 
-	// Step 2: parse the IPV6 header and increment the *nh to the ICMPv6 header
+	// Step 2: parse the ip header and increment the *nh to the icmp header
 	// for step 3
 	if (nh_type == bpf_htons(ETH_P_IPV6)) {
 		ip_type = parse_ip6hdr(&nh, data_end, &ip6hdr);
+	} else if (nh_type == bpf_htons(ETH_P_IP)) {
+		ip_type = parse_iphdr(&nh, data_end, &iphdr);
 	} else {
 		goto out;
 	}
 
-	// Step 3: parse the ICMPv6 header, and check the sequence number.
+	// Step 3: parse the icmp header, and check the sequence number.
 	// Drop the packet if the sequence number is even.
-	if (ip_type == IPPROTO_ICMPV6) {
+	if (ip_type == IPPROTO_ICMPV6)
+	{
 		icmp_type = parse_icmp6hdr(&nh, data_end, &icmp6hdr);
-	} else {
+		if (icmp6hdr + 1 > data_end)
+			goto out;
+		if (bpf_ntohs(icmp6hdr->icmp6_sequence) % 2 == 0)
+			action = XDP_DROP;
+	}
+	else if (ip_type == IPPROTO_ICMP)
+	{
+		icmp_type = parse_icmphdr(&nh, data_end, &icmphdr);
+		if (icmphdr + 1 > data_end)
+			goto out;
+		if (bpf_ntohs(icmphdr->sequence) % 2 == 0)
+			action = XDP_DROP;
+	}
+	else
+	{
 		goto out;
 	}
 
-	// ensure the sequence number access is safe
-	if (icmp6hdr + 1 > data_end)
-		goto out;
-
-	if (bpf_ntohs(icmp6hdr->icmp6_sequence) % 2 == 0) {
-		action = XDP_DROP;
-	} else {
-		action = XDP_PASS;
-	}
 out:
 	return xdp_stats_record_action(ctx, action); /* read via xdp_stats */
 }
