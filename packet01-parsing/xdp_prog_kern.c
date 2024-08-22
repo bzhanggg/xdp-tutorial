@@ -17,6 +17,28 @@ struct hdr_cursor {
 	void *pos;
 };
 
+struct vlan_hdr {
+	__be16 h_vlan_TCI;
+	__be16 h_vlan_encapsulated_proto;
+};
+
+// for loop unrolling
+#ifndef VLAN_MAX_DEPTH
+#define VLAN_MAX_DEPTH 2
+#endif
+
+#define VLAN_VID_MASK 0x0fff /* VLAN identifier */
+// struct for collecting vlans after parsing
+struct collect_vlans {
+	__u16 id[VLAN_MAX_DEPTH];
+};
+
+static __always_inline int proto_is_vlan(__u16 h_proto)
+{
+	return !!(h_proto == bpf_htons(ETH_P_8021Q) ||
+			  h_proto == bpf_htons(ETH_P_8021AD));
+}
+
 /* Packet parsing helpers.
  *
  * Each helper parses a packet header, including doing bounds checking, and
@@ -26,12 +48,15 @@ struct hdr_cursor {
  * (h_proto for Ethernet, nexthdr for IPv6), for ICMP it is the ICMP type field.
  * All return values are in host byte order.
  */
-static __always_inline int parse_ethhdr(struct hdr_cursor *nh,
+static __always_inline int parse_ethhdr_vlan(struct hdr_cursor *nh,
 					void *data_end,
-					struct ethhdr **ethhdr)
+					struct ethhdr **ethhdr,
+					struct collect_vlans *vlans)
 {
 	struct ethhdr *eth = nh->pos;
 	int hdrsize = sizeof(*eth);
+	struct vlan_hdr *vlh;
+	__u16 h_proto;
 
 	/* Byte-count bounds check; check if current pointer + size of header
 	 * is after data_end.
@@ -41,8 +66,33 @@ static __always_inline int parse_ethhdr(struct hdr_cursor *nh,
 
 	nh->pos += hdrsize;
 	*ethhdr = eth;
+	vlh = nh->pos;
+	h_proto = eth->h_proto;
 
-	return eth->h_proto; /* network-byte-order */
+	#pragma unroll
+	for (int i = 0; i < VLAN_MAX_DEPTH; i++) {
+		// skip if not vlan
+		if (!proto_is_vlan(h_proto))
+			break;
+		// skip if out of bounds
+		if (vlh + 1 > data_end)
+			break;
+		
+		h_proto = vlh->h_vlan_encapsulated_proto;
+		if (vlans) /* collect VLAN ids */
+			vlans->id[i] = (bpf_ntohs(vlh->h_vlan_TCI) & VLAN_VID_MASK);
+		vlh++;
+	}
+
+	nh->pos = vlh;
+	return h_proto; /* network-byte-order */
+}
+
+static __always_inline int parse_ethhdr(struct hdr_cursor *nh,
+					void *data_end,
+					struct ethhdr **ethhdr)
+{
+	return parse_ethhdr_vlan(nh, data_end, ethhdr, NULL);
 }
 
 /* Assignment 2: Implement and use this */
@@ -108,20 +158,26 @@ int  xdp_parser_func(struct xdp_md *ctx)
 	 * If the next header type is an IPV6 header, continue, otherwise drop out.
 	*/
 	nh_type = parse_ethhdr(&nh, data_end, &eth); // stores header type
-	if (nh_type != bpf_htons(ETH_P_IPV6))
+	if (nh_type < 0) {
+		action = XDP_ABORTED;
 		goto out;
-
-	/* Assignment additions go below here */
+	}
 
 	// Step 2: parse the IPV6 header and increment the *nh to the ICMPv6 header
 	// for step 3
-	ip_type = parse_ip6hdr(&nh, data_end, &ip6hdr);
-	if (ip_type != IPPROTO_ICMPV6)
+	if (nh_type == bpf_htons(ETH_P_IPV6)) {
+		ip_type = parse_ip6hdr(&nh, data_end, &ip6hdr);
+	} else {
 		goto out;
+	}
 
 	// Step 3: parse the ICMPv6 header, and check the sequence number.
 	// Drop the packet if the sequence number is even.
-	icmp_type = parse_icmp6hdr(&nh, data_end, &icmp6hdr);
+	if (ip_type == IPPROTO_ICMPV6) {
+		icmp_type = parse_icmp6hdr(&nh, data_end, &icmp6hdr);
+	} else {
+		goto out;
+	}
 
 	// ensure the sequence number access is safe
 	if (icmp6hdr + 1 > data_end)
