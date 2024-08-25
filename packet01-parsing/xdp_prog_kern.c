@@ -230,8 +230,11 @@ int  xdp_parser_func(struct xdp_md *ctx)
 		icmp_type = parse_icmphdr(&nh, data_end, &icmphdr);
 		if (icmphdr + 1 > data_end)
 			goto out;
-		if (bpf_ntohs(icmphdr->sequence) % 2 == 0)
-			action = XDP_DROP;
+		
+		if (icmphdr->type == ICMP_ECHO || icmphdr->type == ICMP_ECHOREPLY) {
+			if (bpf_ntohs(icmphdr->un.echo.sequence) % 2 == 0)
+				action = XDP_DROP;
+		}
 	}
 	else
 	{
