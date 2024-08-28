@@ -36,16 +36,44 @@ static __always_inline void swap_src_dst_mac(struct ethhdr *eth)
 {
 	/* Assignment 1: swap source and destination addresses in the eth.
 	 * For simplicity you can use the memcpy macro defined above */
+
+	__u8 tmp[ETH_ALEN];
+	memcpy(tmp, eth->h_source, ETH_ALEN);
+	memcpy(eth->h_source, eth->h_dest, ETH_ALEN);
+	memcpy(eth->h_dest, tmp, ETH_ALEN);
 }
 
 static __always_inline void swap_src_dst_ipv6(struct ipv6hdr *ipv6)
 {
 	/* Assignment 1: swap source and destination addresses in the iphv6dr */
+	struct in6_addr src = ipv6->saddr;
+	ipv6->saddr = ipv6->daddr;
+	ipv6->daddr = src;
 }
 
 static __always_inline void swap_src_dst_ipv4(struct iphdr *iphdr)
 {
 	/* Assignment 1: swap source and destination addresses in the iphdr */
+	__be32 src = iphdr->saddr;
+	iphdr->saddr = iphdr->daddr;
+	iphdr->daddr = src;
+}
+
+static __always_inline __u16 icmp_checksum_diff(
+	__u16 seed,
+	struct icmphdr_common *icmphdr_new,
+	struct icmphdr_common *icmphdr_old)
+{
+	__u32 csum = 0;
+	__u32 size = sizeof(struct icmphdr_common);
+
+	csum = bpf_csum_diff((__be32 *)icmphdr_old, size,
+						 (__be32 *)icmphdr_new, size, seed);
+
+	// handle csum overflow
+	__u32 sum = (csum >> 16) + (csum & 0xffff);
+	sum += (sum >> 16);
+	return ~sum;
 }
 
 /* Implement packet03/assignment-1 in this section */
@@ -61,8 +89,9 @@ int xdp_icmp_echo_func(struct xdp_md *ctx)
 	int icmp_type;
 	struct iphdr *iphdr;
 	struct ipv6hdr *ipv6hdr;
-	__u16 echo_reply;
+	__u16 echo_reply, old_csum;
 	struct icmphdr_common *icmphdr;
+	struct icmphdr_common old_icmphdr;
 	__u32 action = XDP_PASS;
 
 	/* These keep track of the next header type and iterator pointer */
@@ -93,8 +122,7 @@ int xdp_icmp_echo_func(struct xdp_md *ctx)
 		/* Swap IP source and destination */
 		swap_src_dst_ipv4(iphdr);
 		echo_reply = ICMP_ECHOREPLY;
-	} else if (eth_type == bpf_htons(ETH_P_IPV6)
-		   && icmp_type == ICMPV6_ECHO_REQUEST) {
+	} else if (eth_type == bpf_htons(ETH_P_IPV6) && icmp_type == ICMPV6_ECHO_REQUEST) {
 		/* Swap IPv6 source and destination */
 		swap_src_dst_ipv6(ipv6hdr);
 		echo_reply = ICMPV6_ECHO_REPLY;
@@ -107,8 +135,13 @@ int xdp_icmp_echo_func(struct xdp_md *ctx)
 
 	/* Assignment 1: patch the packet and update the checksum. You can use
 	 * the echo_reply variable defined above to fix the ICMP Type field. */
+	old_csum = icmphdr->cksum;
+	icmphdr->cksum = 0;
+	old_icmphdr = *icmphdr;
+	icmphdr->type = echo_reply;
 
-	bpf_printk("echo_reply: %d", echo_reply);
+	// recalculate and set new csum
+	icmphdr->cksum = icmp_checksum_diff(~old_csum, icmphdr, &old_icmphdr);
 
 	action = XDP_TX;
 
