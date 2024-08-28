@@ -17,21 +17,14 @@
  * success or -1 on failure.
  */
 static __always_inline int vlan_tag_pop(struct xdp_md *ctx, struct ethhdr *eth)
-{
-	struct hdr_cursor nh;
-	
+{	
 	void *data_end = (void *)(long)ctx->data_end;
-	// void *data = (void *)(long)ctx->data;
 	struct ethhdr eth_cpy;
 	struct vlan_hdr *vlh;
 
 	__be16 h_proto;
-	int nh_type, vlid;
+	int vlid;
 
-	nh_type = parse_ethhdr(&nh, data_end, &eth);
-	/* Check if there is a vlan tag to pop */
-	if (nh_type < 0)
-		return XDP_PASS;
 	if (!proto_is_vlan(eth->h_proto))
 		return -1;
 
@@ -137,7 +130,7 @@ out:
 /* VLAN swapper; will pop outermost VLAN tag if it exists, otherwise push a new
  * one with ID 1. Use this for assignments 2 and 3.
  */
-SEC("xdp")
+SEC("xdp_swap")
 int xdp_vlan_swap_func(struct xdp_md *ctx)
 {
 	void *data_end = (void *)(long)ctx->data_end;
